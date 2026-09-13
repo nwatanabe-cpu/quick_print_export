@@ -17,10 +17,13 @@ from qgis.PyQt.QtWidgets import (
     QDoubleSpinBox,
     QAbstractSpinBox,
 )
+import math
 from qgis.core import (
     QgsProject,
     QgsPrintLayout,
     QgsLayoutItemMap,
+    QgsLayoutItemLabel,
+    QgsLayoutItemScaleBar,
     QgsLayoutPoint,
     QgsLayoutSize,
     QgsUnitTypes,
@@ -28,6 +31,23 @@ from qgis.core import (
     QgsLayoutExporter,
     QgsCoordinateTransform,
 )
+
+
+def _nice_number(value):
+    """スケールバーの1区間あたりの距離を 1/2/5 * 10^n の "きりのいい" 数値に丸める"""
+    if value <= 0:
+        return 1.0
+    exponent = math.floor(math.log10(value))
+    fraction = value / (10 ** exponent)
+    if fraction < 1.5:
+        nice = 1
+    elif fraction < 3:
+        nice = 2
+    elif fraction < 7:
+        nice = 5
+    else:
+        nice = 10
+    return nice * (10 ** exponent)
 from qgis.gui import QgsMapToolExtent
 
 # 用紙サイズプリセット(mm, 縦向き基準)
@@ -293,7 +313,7 @@ class PrintExportDialog(QDialog):
 
     # ---------------- レイアウト構築 ----------------
 
-    def _build_layout_and_map(self, extent):
+    def _build_layout_and_map(self, extent, add_annotations=False):
         layout = QgsPrintLayout(QgsProject.instance())
         layout.initializeDefaults()
         w_mm = self.spn_paper_w.value()
@@ -314,7 +334,67 @@ class PrintExportDialog(QDialog):
         if not self.chk_auto_scale.isChecked():
             map_item.setScale(self.spn_scale.value())
 
+        if add_annotations:
+            self._add_coordinate_label(layout, map_item, w_mm, h_mm)
+            self._add_scale_bar(layout, map_item, w_mm, h_mm)
+
         return layout, map_item
+
+    def _add_coordinate_label(self, layout, map_item, w_mm, h_mm):
+        """右上座標・左下座標・縮尺を示すラベルを用紙下部に追加する"""
+        ext = map_item.extent()
+        scale = map_item.scale()
+        text = (
+            "右上座標: X={0:.0f}m  Y={1:.0f}m\n"
+            "左下座標: X={2:.0f}m  Y={3:.0f}m\n"
+            "縮尺: 1:{4:.0f}".format(
+                ext.xMaximum(), ext.yMaximum(),
+                ext.xMinimum(), ext.yMinimum(),
+                scale,
+            )
+        )
+        label = QgsLayoutItemLabel(layout)
+        label.setText(text)
+        font = label.font()
+        font.setPointSize(8)
+        label.setFont(font)
+
+        label_w, label_h = 85.0, 16.0
+        margin_bottom, gap, scale_bar_h = 5.0, 2.0, 8.0
+        x = 5.0
+        y = h_mm - margin_bottom - scale_bar_h - gap - label_h
+
+        layout.addLayoutItem(label)
+        label.attemptMove(QgsLayoutPoint(x, y, QgsUnitTypes.LayoutMillimeters))
+        label.attemptResize(QgsLayoutSize(label_w, label_h, QgsUnitTypes.LayoutMillimeters))
+        return label
+
+    def _add_scale_bar(self, layout, map_item, w_mm, h_mm):
+        """ラベル(縮尺表記)のすぐ下にスケールバーを追加する"""
+        scalebar = QgsLayoutItemScaleBar(layout)
+        scalebar.setLinkedMap(map_item)
+        scalebar.setStyle("Single Box")
+        scalebar.setUnits(QgsUnitTypes.DistanceMeters)
+        scalebar.setUnitLabel("m")
+
+        segments = 4
+        extent_width = map_item.extent().width()
+        units_per_segment = _nice_number(extent_width / segments) if extent_width > 0 else 100
+        scalebar.setNumberOfSegments(segments)
+        scalebar.setNumberOfSegmentsLeft(0)
+        scalebar.setUnitsPerSegment(units_per_segment)
+
+        label_w, label_h = 85.0, 16.0
+        margin_bottom, gap, scale_bar_h = 5.0, 2.0, 8.0
+        x = 5.0
+        label_y = h_mm - margin_bottom - scale_bar_h - gap - label_h
+        y = label_y + label_h + gap
+
+        layout.addLayoutItem(scalebar)
+        scalebar.attemptMove(QgsLayoutPoint(x, y, QgsUnitTypes.LayoutMillimeters))
+        scalebar.attemptResize(QgsLayoutSize(label_w, scale_bar_h, QgsUnitTypes.LayoutMillimeters))
+        scalebar.update()
+        return scalebar
 
     def _recompute(self):
         extent = self._get_extent_from_fields()
@@ -357,7 +437,7 @@ class PrintExportDialog(QDialog):
         if not path.lower().endswith(default_ext[fmt]):
             path += default_ext[fmt]
 
-        layout, map_item = self._build_layout_and_map(extent)
+        layout, map_item = self._build_layout_and_map(extent, add_annotations=True)
         exporter = QgsLayoutExporter(layout)
 
         if fmt == "PDF":
