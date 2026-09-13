@@ -1,5 +1,6 @@
 import os
 from qgis.PyQt.QtCore import QRectF
+from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QDialog,
     QVBoxLayout,
@@ -59,6 +60,22 @@ PAPER_SIZES_MM = {
     "A0": (841.0, 1189.0),
     "カスタム": (297.0, 420.0),
 }
+
+# 座標・縮尺ラベルの外観
+BASE_FONT_SIZE_PT = 8
+COORD_FONT_SIZE_PT = BASE_FONT_SIZE_PT + 4  # 「2段階上げる」= 2pt刻みで2段階
+LABEL_BG_COLOR = QColor(255, 255, 255, 220)  # 文字バッファ代わりの半透明白背景
+LABEL_MARGIN_MM = 3.0    # 用紙端からラベルまでの余白
+LABEL_W_MM = 75.0
+LABEL_H_MM = 10.0
+
+# スケールバー(縮尺ラベルの直下、右下寄せ)
+SCALE_BAR_BASE_W_MM = 85.0
+SCALE_BAR_BASE_H_MM = 8.0
+SCALE_BAR_SHRINK = 1.0 / 8.0
+SCALE_BAR_W_MM = SCALE_BAR_BASE_W_MM * SCALE_BAR_SHRINK
+SCALE_BAR_H_MM = SCALE_BAR_BASE_H_MM * SCALE_BAR_SHRINK
+SCALE_BAR_SEGMENTS = 2
 
 
 def _make_coord_spinbox():
@@ -335,64 +352,80 @@ class PrintExportDialog(QDialog):
             map_item.setScale(self.spn_scale.value())
 
         if add_annotations:
-            self._add_coordinate_label(layout, map_item, w_mm, h_mm)
+            self._add_top_right_label(layout, map_item, w_mm, h_mm)
+            self._add_bottom_left_label(layout, map_item, w_mm, h_mm)
+            self._add_scale_label(layout, map_item, w_mm, h_mm)
             self._add_scale_bar(layout, map_item, w_mm, h_mm)
 
         return layout, map_item
 
-    def _add_coordinate_label(self, layout, map_item, w_mm, h_mm):
-        """右上座標・左下座標・縮尺を示すラベルを用紙下部に追加する"""
-        ext = map_item.extent()
-        scale = map_item.scale()
-        text = (
-            "右上座標: X={0:.0f}m  Y={1:.0f}m\n"
-            "左下座標: X={2:.0f}m  Y={3:.0f}m\n"
-            "縮尺: 1:{4:.0f}".format(
-                ext.xMaximum(), ext.yMaximum(),
-                ext.xMinimum(), ext.yMinimum(),
-                scale,
-            )
-        )
+    def _make_corner_label(self, layout, text, x, y):
+        """バッファ(半透明白背景)付きの角ラベルを1個作成して配置する共通処理"""
         label = QgsLayoutItemLabel(layout)
         label.setText(text)
         font = label.font()
-        font.setPointSize(8)
+        font.setPointSize(COORD_FONT_SIZE_PT)
+        font.setBold(True)
         label.setFont(font)
 
-        label_w, label_h = 85.0, 16.0
-        margin_bottom, gap, scale_bar_h = 5.0, 2.0, 8.0
-        x = 5.0
-        y = h_mm - margin_bottom - scale_bar_h - gap - label_h
+        # 文字バッファの代わりに半透明の背景ボックスを敷く
+        label.setBackgroundEnabled(True)
+        label.setBackgroundColor(LABEL_BG_COLOR)
+        label.setMarginX(2.0)
+        label.setMarginY(1.5)
 
         layout.addLayoutItem(label)
         label.attemptMove(QgsLayoutPoint(x, y, QgsUnitTypes.LayoutMillimeters))
-        label.attemptResize(QgsLayoutSize(label_w, label_h, QgsUnitTypes.LayoutMillimeters))
+        label.attemptResize(QgsLayoutSize(LABEL_W_MM, LABEL_H_MM, QgsUnitTypes.LayoutMillimeters))
         return label
 
+    def _add_top_right_label(self, layout, map_item, w_mm, h_mm):
+        """右上座標ラベルを図面(地図アイテム)右上隅に配置"""
+        ext = map_item.extent()
+        text = "X={0:.0f}m  Y={1:.0f}m".format(ext.xMaximum(), ext.yMaximum())
+        x = w_mm - LABEL_W_MM - LABEL_MARGIN_MM
+        y = LABEL_MARGIN_MM
+        return self._make_corner_label(layout, text, x, y)
+
+    def _add_bottom_left_label(self, layout, map_item, w_mm, h_mm):
+        """左下座標ラベルを図面左下隅に配置"""
+        ext = map_item.extent()
+        text = "X={0:.0f}m  Y={1:.0f}m".format(ext.xMinimum(), ext.yMinimum())
+        x = LABEL_MARGIN_MM
+        y = h_mm - LABEL_H_MM - LABEL_MARGIN_MM
+        return self._make_corner_label(layout, text, x, y)
+
+    def _add_scale_label(self, layout, map_item, w_mm, h_mm):
+        """縮尺ラベルを図面右下隅に配置(座標ラベルと同じフォント/バッファ)"""
+        scale = map_item.scale()
+        text = "縮尺 1:{0:.0f}".format(scale)
+        x = w_mm - LABEL_W_MM - LABEL_MARGIN_MM
+        y = h_mm - LABEL_H_MM - LABEL_MARGIN_MM
+        return self._make_corner_label(layout, text, x, y)
+
     def _add_scale_bar(self, layout, map_item, w_mm, h_mm):
-        """ラベル(縮尺表記)のすぐ下にスケールバーを追加する"""
+        """縮尺ラベルの直下(右下寄せ)にスケールバーを配置。サイズは従来の1/8"""
         scalebar = QgsLayoutItemScaleBar(layout)
         scalebar.setLinkedMap(map_item)
         scalebar.setStyle("Single Box")
         scalebar.setUnits(QgsUnitTypes.DistanceMeters)
         scalebar.setUnitLabel("m")
 
-        segments = 4
         extent_width = map_item.extent().width()
-        units_per_segment = _nice_number(extent_width / segments) if extent_width > 0 else 100
-        scalebar.setNumberOfSegments(segments)
+        units_per_segment = (
+            _nice_number(extent_width / SCALE_BAR_SEGMENTS) if extent_width > 0 else 100
+        )
+        scalebar.setNumberOfSegments(SCALE_BAR_SEGMENTS)
         scalebar.setNumberOfSegmentsLeft(0)
         scalebar.setUnitsPerSegment(units_per_segment)
 
-        label_w, label_h = 85.0, 16.0
-        margin_bottom, gap, scale_bar_h = 5.0, 2.0, 8.0
-        x = 5.0
-        label_y = h_mm - margin_bottom - scale_bar_h - gap - label_h
-        y = label_y + label_h + gap
+        x = w_mm - SCALE_BAR_W_MM - LABEL_MARGIN_MM
+        scale_label_bottom = h_mm - LABEL_MARGIN_MM  # 縮尺ラベル(右下)の下端
+        y = scale_label_bottom + 1.0
 
         layout.addLayoutItem(scalebar)
         scalebar.attemptMove(QgsLayoutPoint(x, y, QgsUnitTypes.LayoutMillimeters))
-        scalebar.attemptResize(QgsLayoutSize(label_w, scale_bar_h, QgsUnitTypes.LayoutMillimeters))
+        scalebar.attemptResize(QgsLayoutSize(SCALE_BAR_W_MM, SCALE_BAR_H_MM, QgsUnitTypes.LayoutMillimeters))
         scalebar.update()
         return scalebar
 
