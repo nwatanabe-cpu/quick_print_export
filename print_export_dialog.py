@@ -18,7 +18,6 @@ from qgis.PyQt.QtWidgets import (
     QDoubleSpinBox,
     QAbstractSpinBox,
 )
-import math
 from qgis.core import (
     QgsProject,
     QgsPrintLayout,
@@ -31,24 +30,9 @@ from qgis.core import (
     QgsRectangle,
     QgsLayoutExporter,
     QgsCoordinateTransform,
+    QgsCoordinateReferenceSystem,
+    QgsPointXY,
 )
-
-
-def _nice_number(value):
-    """スケールバーの1区間あたりの距離を 1/2/5 * 10^n の "きりのいい" 数値に丸める"""
-    if value <= 0:
-        return 1.0
-    exponent = math.floor(math.log10(value))
-    fraction = value / (10 ** exponent)
-    if fraction < 1.5:
-        nice = 1
-    elif fraction < 3:
-        nice = 2
-    elif fraction < 7:
-        nice = 5
-    else:
-        nice = 10
-    return nice * (10 ** exponent)
 from qgis.gui import QgsMapToolExtent
 
 # 用紙サイズプリセット(mm, 縦向き基準)
@@ -61,21 +45,23 @@ PAPER_SIZES_MM = {
     "カスタム": (297.0, 420.0),
 }
 
-# 座標・縮尺ラベルの外観
+# 座標・縮尺ラベルの外観(サイズは adjustSizeToText() で文字量に応じて自動決定)
 BASE_FONT_SIZE_PT = 8
 COORD_FONT_SIZE_PT = BASE_FONT_SIZE_PT + 4  # 「2段階上げる」= 2pt刻みで2段階
 LABEL_BG_COLOR = QColor(255, 255, 255, 220)  # 文字バッファ代わりの半透明白背景
 LABEL_MARGIN_MM = 3.0    # 用紙端からラベルまでの余白
-LABEL_W_MM = 75.0
-LABEL_H_MM = 10.0
+LATLON_DECIMALS = 6      # 緯度経度の小数桁数(6桁で約10cm精度)
 
 # スケールバー(縮尺ラベルの直下、右下寄せ)
-SCALE_BAR_BASE_W_MM = 85.0
-SCALE_BAR_BASE_H_MM = 8.0
+# 印刷上の物理サイズは「区間数 × 1区間の実距離 ÷ 縮尺」で決まる仕組みのため、
+# ここでは "紙の上で何mmにしたいか" から逆算して1区間の実距離を求める。
+SCALE_BAR_BASE_TOTAL_WIDTH_MM = 85.0
 SCALE_BAR_SHRINK = 1.0 / 8.0
-SCALE_BAR_W_MM = SCALE_BAR_BASE_W_MM * SCALE_BAR_SHRINK
-SCALE_BAR_H_MM = SCALE_BAR_BASE_H_MM * SCALE_BAR_SHRINK
+SCALE_BAR_TARGET_WIDTH_MM = SCALE_BAR_BASE_TOTAL_WIDTH_MM * SCALE_BAR_SHRINK
 SCALE_BAR_SEGMENTS = 2
+SCALE_BAR_BOX_HEIGHT_MM = 1.5   # 目盛りボックス自体の高さ(文字ラベル分は別途自動で足される)
+SCALE_BAR_FONT_PT = 6
+SCALE_BAR_RESERVED_HEIGHT_MM = 7.0  # レイアウト上でスケールバーに確保しておく縦スペースの目安
 
 
 def _make_coord_spinbox():
@@ -94,6 +80,7 @@ class PrintExportDialog(QDialog):
         self.canvas = iface.mapCanvas()
         self._prev_map_tool = None
         self._extent_tool = None
+        self._preview_layout_name = "座標指定プレビュー"
 
         self.setWindowTitle("座標指定 印刷/エクスポート")
         self._build_ui()
@@ -225,9 +212,11 @@ class PrintExportDialog(QDialog):
 
         # --- 実行ボタン ---
         h_run = QHBoxLayout()
+        self.btn_preview = QPushButton("プレビュー")
         self.btn_export = QPushButton("出力実行")
         self.btn_close = QPushButton("閉じる")
         h_run.addStretch()
+        h_run.addWidget(self.btn_preview)
         h_run.addWidget(self.btn_export)
         h_run.addWidget(self.btn_close)
         root.addLayout(h_run)
@@ -243,6 +232,7 @@ class PrintExportDialog(QDialog):
         self.btn_pick_full_extent.clicked.connect(self._use_full_layer_extent)
         self.btn_drag_extent.clicked.connect(self._start_drag_extent)
         self.btn_recompute.clicked.connect(self._recompute)
+        self.btn_preview.clicked.connect(self._do_preview)
         self.btn_export.clicked.connect(self._do_export)
         self.btn_close.clicked.connect(self.close)
 
@@ -354,13 +344,22 @@ class PrintExportDialog(QDialog):
         if add_annotations:
             self._add_top_right_label(layout, map_item, w_mm, h_mm)
             self._add_bottom_left_label(layout, map_item, w_mm, h_mm)
-            self._add_scale_label(layout, map_item, w_mm, h_mm)
-            self._add_scale_bar(layout, map_item, w_mm, h_mm)
+            self._add_scale_label_and_bar(layout, map_item, w_mm, h_mm)
 
         return layout, map_item
 
-    def _make_corner_label(self, layout, text, x, y):
-        """バッファ(半透明白背景)付きの角ラベルを1個作成して配置する共通処理"""
+    def _to_latlon(self, x, y):
+        """プロジェクトCRSの座標(x, y)をEPSG:4326の(経度, 緯度)に変換する"""
+        src_crs = self.canvas.mapSettings().destinationCrs()
+        dst_crs = QgsCoordinateReferenceSystem("EPSG:4326")
+        transform = QgsCoordinateTransform(src_crs, dst_crs, QgsProject.instance())
+        pt = transform.transform(QgsPointXY(x, y))
+        return pt.x(), pt.y()  # 経度, 緯度
+
+    def _make_corner_label(self, layout, text, corner, w_mm, h_mm, y_top=None):
+        """バッファ(半透明白背景)付きの角ラベルを1個作成し、文字サイズに合わせて
+        自動リサイズしたうえで指定の角に配置する。戻り値は (label, 幅mm, 高さmm)。
+        """
         label = QgsLayoutItemLabel(layout)
         label.setText(text)
         font = label.font()
@@ -375,58 +374,84 @@ class PrintExportDialog(QDialog):
         label.setMarginY(1.5)
 
         layout.addLayoutItem(label)
+        label.adjustSizeToText()  # 文字量に合わせてボックスサイズを自動決定
+
+        size = label.sizeWithUnits()
+        label_w = size.width()
+        label_h = size.height()
+
+        if corner == "top-right":
+            x = w_mm - label_w - LABEL_MARGIN_MM
+            y = LABEL_MARGIN_MM
+        elif corner == "bottom-left":
+            x = LABEL_MARGIN_MM
+            y = h_mm - label_h - LABEL_MARGIN_MM
+        elif corner == "bottom-right":
+            x = w_mm - label_w - LABEL_MARGIN_MM
+            y = y_top if y_top is not None else (h_mm - label_h - LABEL_MARGIN_MM)
+        else:
+            raise ValueError(f"unknown corner: {corner}")
+
         label.attemptMove(QgsLayoutPoint(x, y, QgsUnitTypes.LayoutMillimeters))
-        label.attemptResize(QgsLayoutSize(LABEL_W_MM, LABEL_H_MM, QgsUnitTypes.LayoutMillimeters))
-        return label
+        return label, label_w, label_h
 
     def _add_top_right_label(self, layout, map_item, w_mm, h_mm):
-        """右上座標ラベルを図面(地図アイテム)右上隅に配置"""
+        """右上座標ラベル(緯度経度)を図面右上隅に配置"""
         ext = map_item.extent()
-        text = "X={0:.0f}m  Y={1:.0f}m".format(ext.xMaximum(), ext.yMaximum())
-        x = w_mm - LABEL_W_MM - LABEL_MARGIN_MM
-        y = LABEL_MARGIN_MM
-        return self._make_corner_label(layout, text, x, y)
+        lon, lat = self._to_latlon(ext.xMaximum(), ext.yMaximum())
+        text = "経度={0:.{2}f}°  緯度={1:.{2}f}°".format(lon, lat, LATLON_DECIMALS)
+        return self._make_corner_label(layout, text, "top-right", w_mm, h_mm)
 
     def _add_bottom_left_label(self, layout, map_item, w_mm, h_mm):
-        """左下座標ラベルを図面左下隅に配置"""
+        """左下座標ラベル(緯度経度)を図面左下隅に配置"""
         ext = map_item.extent()
-        text = "X={0:.0f}m  Y={1:.0f}m".format(ext.xMinimum(), ext.yMinimum())
-        x = LABEL_MARGIN_MM
-        y = h_mm - LABEL_H_MM - LABEL_MARGIN_MM
-        return self._make_corner_label(layout, text, x, y)
+        lon, lat = self._to_latlon(ext.xMinimum(), ext.yMinimum())
+        text = "経度={0:.{2}f}°  緯度={1:.{2}f}°".format(lon, lat, LATLON_DECIMALS)
+        return self._make_corner_label(layout, text, "bottom-left", w_mm, h_mm)
 
-    def _add_scale_label(self, layout, map_item, w_mm, h_mm):
-        """縮尺ラベルを図面右下隅に配置(座標ラベルと同じフォント/バッファ)"""
+    def _add_scale_label_and_bar(self, layout, map_item, w_mm, h_mm):
+        """縮尺ラベルを図面右下隅に配置し、その直下にスケールバーを配置する"""
         scale = map_item.scale()
         text = "縮尺 1:{0:.0f}".format(scale)
-        x = w_mm - LABEL_W_MM - LABEL_MARGIN_MM
-        y = h_mm - LABEL_H_MM - LABEL_MARGIN_MM
-        return self._make_corner_label(layout, text, x, y)
+        # スケールバー分の縦スペースをあらかじめ下に確保しておく
+        y_top = h_mm - LABEL_MARGIN_MM - SCALE_BAR_RESERVED_HEIGHT_MM
+        # ラベル自身の高さは adjustSizeToText 後でないと分からないため、
+        # いったん確保領域の上端を仮のy座標として渡す
+        label, label_w, label_h = self._make_corner_label(
+            layout, text, "bottom-right", w_mm, h_mm, y_top=y_top
+        )
+        # ラベルの下端を基準にスケールバーを配置
+        label_bottom = y_top + label_h
+        self._add_scale_bar(layout, map_item, w_mm, label_x=w_mm - LABEL_MARGIN_MM, y=label_bottom + 1.0)
 
-    def _add_scale_bar(self, layout, map_item, w_mm, h_mm):
-        """縮尺ラベルの直下(右下寄せ)にスケールバーを配置。サイズは従来の1/8"""
+    def _add_scale_bar(self, layout, map_item, w_mm, label_x, y):
+        """指定位置にスケールバーを配置する(右端がlabel_xに揃うよう右詰め)。
+        印刷上の物理幅は「区間数 × 1区間の実距離 ÷ 縮尺」で決まるため、
+        目標のmm幅から逆算して1区間あたりの実距離(m)を求める。
+        """
         scalebar = QgsLayoutItemScaleBar(layout)
+        layout.addLayoutItem(scalebar)
         scalebar.setLinkedMap(map_item)
         scalebar.setStyle("Single Box")
         scalebar.setUnits(QgsUnitTypes.DistanceMeters)
         scalebar.setUnitLabel("m")
-
-        extent_width = map_item.extent().width()
-        units_per_segment = (
-            _nice_number(extent_width / SCALE_BAR_SEGMENTS) if extent_width > 0 else 100
-        )
         scalebar.setNumberOfSegments(SCALE_BAR_SEGMENTS)
         scalebar.setNumberOfSegmentsLeft(0)
+        scalebar.setHeight(SCALE_BAR_BOX_HEIGHT_MM)
+
+        text_format = scalebar.textFormat()
+        text_format.setSize(SCALE_BAR_FONT_PT)
+        scalebar.setTextFormat(text_format)
+
+        scale_denom = map_item.scale()
+        units_per_segment = (SCALE_BAR_TARGET_WIDTH_MM * scale_denom) / (1000.0 * SCALE_BAR_SEGMENTS)
         scalebar.setUnitsPerSegment(units_per_segment)
 
-        x = w_mm - SCALE_BAR_W_MM - LABEL_MARGIN_MM
-        scale_label_bottom = h_mm - LABEL_MARGIN_MM  # 縮尺ラベル(右下)の下端
-        y = scale_label_bottom + 1.0
-
-        layout.addLayoutItem(scalebar)
+        # 右詰めにするため、実際の幅が確定してから位置を合わせ直す
+        scalebar.attemptMove(QgsLayoutPoint(0, y, QgsUnitTypes.LayoutMillimeters))
+        actual_w = scalebar.sizeWithUnits().width()
+        x = label_x - actual_w
         scalebar.attemptMove(QgsLayoutPoint(x, y, QgsUnitTypes.LayoutMillimeters))
-        scalebar.attemptResize(QgsLayoutSize(SCALE_BAR_W_MM, SCALE_BAR_H_MM, QgsUnitTypes.LayoutMillimeters))
-        scalebar.update()
         return scalebar
 
     def _recompute(self):
@@ -451,6 +476,29 @@ class PrintExportDialog(QDialog):
                 final_extent.width(),
                 final_extent.height(),
             )
+        )
+
+    # ---------------- プレビュー ----------------
+
+    def _do_preview(self):
+        extent = self._get_extent_from_fields()
+        if extent.isEmpty():
+            QMessageBox.warning(self, "範囲エラー", "左下座標・右上座標を正しく入力してください。")
+            return
+
+        layout, map_item = self._build_layout_and_map(extent, add_annotations=True)
+        layout.setName(self._preview_layout_name)
+
+        manager = QgsProject.instance().layoutManager()
+        # 前回のプレビューが残っていれば置き換える(実行のたびに増殖させない)
+        existing = manager.layoutByName(self._preview_layout_name)
+        if existing is not None:
+            manager.removeLayout(existing)
+        manager.addLayout(layout)
+
+        self.iface.openLayoutDesigner(layout)
+        self.lbl_status.setText(
+            "プレビューを開きました(レイアウトデザイナー: 「{0}」)。".format(self._preview_layout_name)
         )
 
     # ---------------- 出力 ----------------
