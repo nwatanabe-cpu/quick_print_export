@@ -30,9 +30,8 @@ from qgis.core import (
     QgsRectangle,
     QgsLayoutExporter,
     QgsCoordinateTransform,
-    QgsCoordinateReferenceSystem,
-    QgsPointXY,
 )
+import math
 from qgis.gui import QgsMapToolExtent
 
 # 用紙サイズプリセット(mm, 縦向き基準)
@@ -45,23 +44,36 @@ PAPER_SIZES_MM = {
     "カスタム": (297.0, 420.0),
 }
 
-# 座標・縮尺ラベルの外観(サイズは adjustSizeToText() で文字量に応じて自動決定)
-BASE_FONT_SIZE_PT = 8
-COORD_FONT_SIZE_PT = BASE_FONT_SIZE_PT + 4  # 「2段階上げる」= 2pt刻みで2段階
-LABEL_BG_COLOR = QColor(255, 255, 255, 220)  # 文字バッファ代わりの半透明白背景
+# 座標ラベルの外観(サイズは adjustSizeToText() で文字量に応じて自動決定)
+COORD_FONT_SIZE_PT = 12
+LABEL_BG_COLOR = QColor(255, 255, 255, 255)  # 見本に合わせて不透明な白背景
 LABEL_MARGIN_MM = 3.0    # 用紙端からラベルまでの余白
-LATLON_DECIMALS = 6      # 緯度経度の小数桁数(6桁で約10cm精度)
+COORD_DECIMALS = 3       # 座標(メートル表記)の小数桁数
 
-# スケールバー(縮尺ラベルの直下、右下寄せ)
-# 印刷上の物理サイズは「区間数 × 1区間の実距離 ÷ 縮尺」で決まる仕組みのため、
-# ここでは "紙の上で何mmにしたいか" から逆算して1区間の実距離を求める。
-SCALE_BAR_BASE_TOTAL_WIDTH_MM = 85.0
-SCALE_BAR_SHRINK = 1.0 / 8.0
-SCALE_BAR_TARGET_WIDTH_MM = SCALE_BAR_BASE_TOTAL_WIDTH_MM * SCALE_BAR_SHRINK
-SCALE_BAR_SEGMENTS = 2
-SCALE_BAR_BOX_HEIGHT_MM = 1.5   # 目盛りボックス自体の高さ(文字ラベル分は別途自動で足される)
-SCALE_BAR_FONT_PT = 6
-SCALE_BAR_RESERVED_HEIGHT_MM = 7.0  # レイアウト上でスケールバーに確保しておく縦スペースの目安
+# スケールバー(見本画像に合わせ、目盛り線+両端の数値+縮尺比を右下にまとめて配置)
+SCALE_BAR_STYLE = "Line Ticks Middle"
+SCALE_BAR_TARGET_WIDTH_MM = 40.0   # おおよその目標幅(実際は「きりのいい数値」丸めのため多少前後する)
+SCALE_BAR_SEGMENTS = 1              # 見本の「0 〜 200」のように単一区間
+SCALE_BAR_FONT_PT = 8
+SCALE_RATIO_FONT_PT = 8
+SCALE_ROW_GAP_MM = 3.0   # スケールバー右端と縮尺比テキストの間隔
+
+
+def _nice_number(value):
+    """スケールバーの区間距離を 1/2/5 * 10^n の "きりのいい" 数値に丸める"""
+    if value <= 0:
+        return 1.0
+    exponent = math.floor(math.log10(value))
+    fraction = value / (10 ** exponent)
+    if fraction < 1.5:
+        nice = 1
+    elif fraction < 3:
+        nice = 2
+    elif fraction < 7:
+        nice = 5
+    else:
+        nice = 10
+    return nice * (10 ** exponent)
 
 
 def _make_coord_spinbox():
@@ -71,6 +83,7 @@ def _make_coord_spinbox():
     sb.setButtonSymbols(QAbstractSpinBox.NoButtons)  # スクロールでの誤操作防止
     sb.setMinimumWidth(130)
     return sb
+
 
 
 class PrintExportDialog(QDialog):
@@ -348,16 +361,20 @@ class PrintExportDialog(QDialog):
 
         return layout, map_item
 
-    def _to_latlon(self, x, y):
-        """プロジェクトCRSの座標(x, y)をEPSG:4326の(経度, 緯度)に変換する"""
-        src_crs = self.canvas.mapSettings().destinationCrs()
-        dst_crs = QgsCoordinateReferenceSystem("EPSG:4326")
-        transform = QgsCoordinateTransform(src_crs, dst_crs, QgsProject.instance())
-        pt = transform.transform(QgsPointXY(x, y))
-        return pt.x(), pt.y()  # 経度, 緯度
+    def _add_top_right_label(self, layout, map_item, w_mm, h_mm):
+        """右上座標ラベル(メートル表記)を図面右上隅に配置。見本の「右上座標値(X,Y)」形式"""
+        ext = map_item.extent()
+        text = "右上座標値({0:.{2}f},{1:.{2}f})".format(ext.xMaximum(), ext.yMaximum(), COORD_DECIMALS)
+        return self._make_corner_label(layout, text, "top-right", w_mm, h_mm)
+
+    def _add_bottom_left_label(self, layout, map_item, w_mm, h_mm):
+        """左下座標ラベル(メートル表記)を図面左下隅に配置。見本の「左下座標値(X,Y)」形式"""
+        ext = map_item.extent()
+        text = "左下座標値({0:.{2}f},{1:.{2}f})".format(ext.xMinimum(), ext.yMinimum(), COORD_DECIMALS)
+        return self._make_corner_label(layout, text, "bottom-left", w_mm, h_mm)
 
     def _make_corner_label(self, layout, text, corner, w_mm, h_mm, y_top=None):
-        """バッファ(半透明白背景)付きの角ラベルを1個作成し、文字サイズに合わせて
+        """バッファ(不透明白背景)付きの角ラベルを1個作成し、文字サイズに合わせて
         自動リサイズしたうえで指定の角に配置する。戻り値は (label, 幅mm, 高さmm)。
         """
         label = QgsLayoutItemLabel(layout)
@@ -367,7 +384,7 @@ class PrintExportDialog(QDialog):
         font.setBold(True)
         label.setFont(font)
 
-        # 文字バッファの代わりに半透明の背景ボックスを敷く
+        # 文字バッファの代わりに不透明の背景ボックスを敷く
         label.setBackgroundEnabled(True)
         label.setBackgroundColor(LABEL_BG_COLOR)
         label.setMarginX(2.0)
@@ -395,64 +412,64 @@ class PrintExportDialog(QDialog):
         label.attemptMove(QgsLayoutPoint(x, y, QgsUnitTypes.LayoutMillimeters))
         return label, label_w, label_h
 
-    def _add_top_right_label(self, layout, map_item, w_mm, h_mm):
-        """右上座標ラベル(緯度経度)を図面右上隅に配置"""
-        ext = map_item.extent()
-        lon, lat = self._to_latlon(ext.xMaximum(), ext.yMaximum())
-        text = "経度={0:.{2}f}°  緯度={1:.{2}f}°".format(lon, lat, LATLON_DECIMALS)
-        return self._make_corner_label(layout, text, "top-right", w_mm, h_mm)
-
-    def _add_bottom_left_label(self, layout, map_item, w_mm, h_mm):
-        """左下座標ラベル(緯度経度)を図面左下隅に配置"""
-        ext = map_item.extent()
-        lon, lat = self._to_latlon(ext.xMinimum(), ext.yMinimum())
-        text = "経度={0:.{2}f}°  緯度={1:.{2}f}°".format(lon, lat, LATLON_DECIMALS)
-        return self._make_corner_label(layout, text, "bottom-left", w_mm, h_mm)
-
     def _add_scale_label_and_bar(self, layout, map_item, w_mm, h_mm):
-        """縮尺ラベルを図面右下隅に配置し、その直下にスケールバーを配置する"""
-        scale = map_item.scale()
-        text = "縮尺 1:{0:.0f}".format(scale)
-        # スケールバー分の縦スペースをあらかじめ下に確保しておく
-        y_top = h_mm - LABEL_MARGIN_MM - SCALE_BAR_RESERVED_HEIGHT_MM
-        # ラベル自身の高さは adjustSizeToText 後でないと分からないため、
-        # いったん確保領域の上端を仮のy座標として渡す
-        label, label_w, label_h = self._make_corner_label(
-            layout, text, "bottom-right", w_mm, h_mm, y_top=y_top
+        """見本画像の右下スケール表記(目盛り線+数値+縮尺比)を配置する"""
+        y = h_mm - LABEL_MARGIN_MM - 10.0  # スケールバー本体+目盛り数値ぶんの余白を確保
+        scalebar, bar_w, bar_h = self._add_scale_bar(layout, map_item, x_right=w_mm - LABEL_MARGIN_MM, y=y)
+        self._add_scale_ratio_text(
+            layout, map_item, x_right=w_mm - LABEL_MARGIN_MM - bar_w - SCALE_ROW_GAP_MM, y=y
         )
-        # ラベルの下端を基準にスケールバーを配置
-        label_bottom = y_top + label_h
-        self._add_scale_bar(layout, map_item, w_mm, label_x=w_mm - LABEL_MARGIN_MM, y=label_bottom + 1.0)
 
-    def _add_scale_bar(self, layout, map_item, w_mm, label_x, y):
-        """指定位置にスケールバーを配置する(右端がlabel_xに揃うよう右詰め)。
-        印刷上の物理幅は「区間数 × 1区間の実距離 ÷ 縮尺」で決まるため、
-        目標のmm幅から逆算して1区間あたりの実距離(m)を求める。
+    def _add_scale_bar(self, layout, map_item, x_right, y):
+        """目盛り線+両端の数値(0, 距離)のスケールバーを配置する(右端がx_rightに揃うよう右詰め)。
+        印刷上の物理幅は「区間数 × 1区間の実距離 ÷ 縮尺」で自動的に決まるため、
+        目標のmm幅に近い「きりのいい」実距離を _nice_number で求めてから設定する。
         """
         scalebar = QgsLayoutItemScaleBar(layout)
         layout.addLayoutItem(scalebar)
         scalebar.setLinkedMap(map_item)
-        scalebar.setStyle("Single Box")
+        scalebar.setStyle(SCALE_BAR_STYLE)
         scalebar.setUnits(QgsUnitTypes.DistanceMeters)
-        scalebar.setUnitLabel("m")
+        scalebar.setUnitLabel("")  # 見本には m 等の単位表記が無いため省略
         scalebar.setNumberOfSegments(SCALE_BAR_SEGMENTS)
         scalebar.setNumberOfSegmentsLeft(0)
-        scalebar.setHeight(SCALE_BAR_BOX_HEIGHT_MM)
 
         text_format = scalebar.textFormat()
         text_format.setSize(SCALE_BAR_FONT_PT)
         scalebar.setTextFormat(text_format)
 
         scale_denom = map_item.scale()
-        units_per_segment = (SCALE_BAR_TARGET_WIDTH_MM * scale_denom) / (1000.0 * SCALE_BAR_SEGMENTS)
+        approx_units = (SCALE_BAR_TARGET_WIDTH_MM * scale_denom) / 1000.0
+        units_per_segment = _nice_number(approx_units)
         scalebar.setUnitsPerSegment(units_per_segment)
 
         # 右詰めにするため、実際の幅が確定してから位置を合わせ直す
         scalebar.attemptMove(QgsLayoutPoint(0, y, QgsUnitTypes.LayoutMillimeters))
-        actual_w = scalebar.sizeWithUnits().width()
-        x = label_x - actual_w
+        size = scalebar.sizeWithUnits()
+        x = x_right - size.width()
         scalebar.attemptMove(QgsLayoutPoint(x, y, QgsUnitTypes.LayoutMillimeters))
-        return scalebar
+        return scalebar, size.width(), size.height()
+
+    def _add_scale_ratio_text(self, layout, map_item, x_right, y):
+        """スケールバーの左隣に「1:5000」のような縮尺比テキストを配置する"""
+        scale = map_item.scale()
+        label = QgsLayoutItemLabel(layout)
+        label.setText("1:{0:.0f}".format(scale))
+        font = label.font()
+        font.setPointSize(SCALE_RATIO_FONT_PT)
+        label.setFont(font)
+        label.setBackgroundEnabled(True)
+        label.setBackgroundColor(LABEL_BG_COLOR)
+        label.setMarginX(1.5)
+        label.setMarginY(1.0)
+
+        layout.addLayoutItem(label)
+        label.adjustSizeToText()
+        size = label.sizeWithUnits()
+        x = x_right - size.width()
+        # スケールバーの目盛り線と縦位置を揃える(バー上端付近)
+        label.attemptMove(QgsLayoutPoint(x, y, QgsUnitTypes.LayoutMillimeters))
+        return label
 
     def _recompute(self):
         extent = self._get_extent_from_fields()
