@@ -1,0 +1,41 @@
+name: Build and publish plugin zip
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build plugin zip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO_NAME="$(basename "$GITHUB_WORKSPACE")"
+          BASE_DIR="$(dirname "$GITHUB_WORKSPACE")"
+          ZIP_NAME="${REPO_NAME}-${GITHUB_REF_NAME}.zip"
+          ZIP_PATH="${BASE_DIR}/${ZIP_NAME}"
+
+          cd "$BASE_DIR"
+          rm -f "$ZIP_PATH"
+
+          zip -r "$ZIP_NAME" "$REPO_NAME" \
+            -x "${REPO_NAME}/.git/*" \
+            -x "${REPO_NAME}/.github/*"
+
+          echo "ZIP_PATH=${ZIP_PATH}" >> "$GITHUB_ENV"
+
+      - name: Create GitHub release and upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_PATH }}
+          generate_release_notes: true
