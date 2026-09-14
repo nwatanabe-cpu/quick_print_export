@@ -2,7 +2,7 @@
 name=Quick Print Export
 qgisMinimumVersion=3.28
 description=用紙範囲座標(左下/右上)・縮尺・回転角を直接指定してキャンバスをPDF/PNGへ出力する
-version=1.0.0
+version=1.0.2
 author=R.Kobayashi
 email=n.watanabe@jforest-kitashinshu.or.jp
 about=印刷レイアウトを開かず、範囲座標・縮尺・図面角度を直接指定して現在のキャンバスをPDF/PNGへワンクリック出力するプラグイン
